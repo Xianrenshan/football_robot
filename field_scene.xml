@@ -1,0 +1,65 @@
+<mujoco model="football_field_scene">
+  <compiler angle="radian" autolimits="true"/>
+
+  <!-- 1. 按照官方规范置于顶部引入 Go1，确保 schema 解析合规且作为主智能体 -->
+  <include file="../robots_location/mujoco_menagerie/unitree_go1/go1.xml"/>
+
+  <statistic center="0 0 0.5" extent="4.0"/>
+
+  <visual>
+    <!-- 关闭随相机剧烈晃动的头灯，消除视角旋转/移动时的反射光斑频闪 -->
+    <headlight diffuse="0 0 0" ambient="0 0 0" specular="0 0 0"/>
+    <rgba haze="0 0 0 0"/>
+    <global azimuth="-135" elevation="-25"/>
+  </visual>
+
+  <asset>
+    <!-- 天空盒与草地材质 -->
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0.05 0.1 0.2" width="512" height="300"/>
+    <texture type="2d" name="grass" builtin="checker" mark="none" rgb1="0.18 0.45 0.18" rgb2="0.15 0.40 0.15" width="200" height="200"/>
+    <material name="grass_mat" texture="grass" texrepeat="20 20" reflectance="0.05"/>
+    
+    <material name="line_mat" rgba="0.95 0.95 0.95 1" reflectance="0.1"/>
+    <material name="goal_mat" rgba="0.9 0.9 0.9 1" reflectance="0.2"/>
+    <material name="wall_mat" rgba="0.3 0.3 0.35 0.6"/>
+    <material name="ball_mat" rgba="0.95 0.2 0.2 1" reflectance="0.3"/>
+  </asset>
+
+  <worldbody>
+    <!-- 强化固定全局主光源与环境光，提供稳定清晰的光影基准 -->
+    <light pos="0 0 5.0" dir="0 0 -1" directional="true" diffuse="0.9 0.9 0.9" specular="0.1 0.1 0.1" ambient="0.4 0.4 0.4"/>
+
+    <!-- 2. 草皮主地面 (9m x 6m) -->
+    <geom name="field_floor" size="4.5 3.0 0.05" pos="0 0 -0.05" type="box" material="grass_mat" friction="0.8 0.01 0.005"/>
+
+    <!-- 3. 足球场白色标线 -->
+    <geom name="mid_line" size="0.03 3.0 0.001" pos="0 0 0.001" type="box" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="line_top" size="4.5 0.03 0.001" pos="0 3.0 0.001" type="box" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="line_bottom" size="4.5 0.03 0.001" pos="0 -3.0 0.001" type="box" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="line_left" size="0.03 3.0 0.001" pos="-4.5 0 0.001" type="box" material="line_mat" conaffinity="0" contype="0"/>
+    <geom name="line_right" size="0.03 3.0 0.001" pos="4.5 0 0.001" type="box" material="line_mat" conaffinity="0" contype="0"/>
+
+    <!-- 4. 四周防撞挡板 -->
+    <geom name="wall_n" size="4.55 0.05 0.15" pos="0 3.05 0.15" type="box" material="wall_mat"/>
+    <geom name="wall_s" size="4.55 0.05 0.15" pos="0 -3.05 0.15" type="box" material="wall_mat"/>
+    <geom name="wall_w" size="0.05 3.05 0.15" pos="-4.55 0 0.15" type="box" material="wall_mat"/>
+    <geom name="wall_e" size="0.05 3.05 0.15" pos="4.55 0 0.15" type="box" material="wall_mat"/>
+
+    <!-- 5. 正前方球门 -->
+    <body name="goal_post" pos="4.4 0 0">
+      <geom size="0.03 0.5" pos="0 -0.8 0.5" type="cylinder" material="goal_mat"/>
+      <geom size="0.03 0.5" pos="0 0.8 0.5" type="cylinder" material="goal_mat"/>
+      <geom size="0.03 0.8" pos="0 0 1.0" euler="1.5708 0 0" type="cylinder" material="goal_mat"/>
+      <geom size="0.25 0.8 0.5" pos="0.25 0 0.5" type="box" rgba="0.8 0.8 0.8 0.3"/>
+    </body>
+
+    <!-- 6. 真实物理 5 号足球 (半径 11cm, 质量 0.43kg) -->
+    <body name="soccer_ball" pos="1.2 0 0.11">
+      <freejoint name="ball_joint"/>
+      <geom name="ball_geom" type="sphere" size="0.11" mass="0.43" 
+            material="ball_mat" 
+            friction="0.7 0.01 0.002" 
+            solref="0.015 1" solimp="0.9 0.95 0.001"/>
+    </body>
+  </worldbody>
+</mujoco>
