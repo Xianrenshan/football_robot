@@ -80,29 +80,38 @@
     },
     "observation_layout": [
         {
-            "name": "projected_gravity",
+            "name": "base_ang_vel",
             "dim": 3,
             "slice": [
                 0,
                 3
             ],
+            "description": "机身本体坐标系角速度 (3维, IMU)"
+        },
+        {
+            "name": "projected_gravity",
+            "dim": 3,
+            "slice": [
+                3,
+                6
+            ],
             "description": "机身坐标系重力投影向量 (3维)"
         },
         {
-            "name": "commands",
-            "dim": 15,
+            "name": "velocity_commands",
+            "dim": 3,
             "slice": [
-                3,
-                18
+                6,
+                9
             ],
-            "description": "15 维速度与 MoB 步态调谐指令"
+            "description": "3 维线速度与角速度指令"
         },
         {
             "name": "dof_pos_residual",
             "dim": 12,
             "slice": [
-                18,
-                30
+                9,
+                21
             ],
             "description": "12 关节与默认角度偏差 (q - q_default)"
         },
@@ -110,8 +119,8 @@
             "name": "dof_vel",
             "dim": 12,
             "slice": [
-                30,
-                42
+                21,
+                33
             ],
             "description": "12 关节旋转角速度"
         },
@@ -119,8 +128,8 @@
             "name": "actions",
             "dim": 12,
             "slice": [
-                42,
-                54
+                33,
+                45
             ],
             "description": "上一个周期的网络输出动作 (12维)"
         },
@@ -128,10 +137,19 @@
             "name": "last_actions",
             "dim": 12,
             "slice": [
-                54,
-                66
+                45,
+                57
             ],
             "description": "上上周期的历史动作 (12维)"
+        },
+        {
+            "name": "mob_commands",
+            "dim": 12,
+            "slice": [
+                57,
+                69
+            ],
+            "description": "12 维 MoB 步态调谐指令"
         }
     ]
 }

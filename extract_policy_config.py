@@ -61,20 +61,17 @@ def extract_and_build_config(raw_data):
     env_cfg = cfg.get("env", {})
     if hasattr(env_cfg, '__dict__'):
         env_cfg = vars(env_cfg)
-
     num_observations = int(env_cfg.get("num_observations", 70))
     num_obs_history = int(env_cfg.get("num_observation_history", 30))
     num_actions = int(env_cfg.get("num_actions", 12))
 
-    # 2. 提取运控参数 (Kp, Kd, action_scale)
+    # 2. 提取运控参数
     control_cfg = cfg.get("control", {})
     if hasattr(control_cfg, '__dict__'):
         control_cfg = vars(control_cfg)
-
     stiffness = control_cfg.get("stiffness", {})
     damping = control_cfg.get("damping", {})
     action_scale = float(control_cfg.get("action_scale", 0.25))
-
     kp_val = float(list(stiffness.values())[0]) if stiffness else 20.0
     kd_val = float(list(damping.values())[0]) if damping else 0.5
 
@@ -82,15 +79,12 @@ def extract_and_build_config(raw_data):
     init_state_cfg = cfg.get("init_state", {})
     if hasattr(init_state_cfg, '__dict__'):
         init_state_cfg = vars(init_state_cfg)
-
     default_angles_dict = init_state_cfg.get("default_joint_angles", {
         "FL_hip_joint": 0.1, "FL_thigh_joint": 0.8, "FL_calf_joint": -1.5,
         "FR_hip_joint": -0.1, "FR_thigh_joint": 0.8, "FR_calf_joint": -1.5,
         "RL_hip_joint": 0.1, "RL_thigh_joint": 1.0, "RL_calf_joint": -1.5,
         "RR_hip_joint": -0.1, "RR_thigh_joint": 1.0, "RR_calf_joint": -1.5,
     })
-
-    # 标准 12 关节排布顺序 (FL, FR, RL, RR)
     joint_names_order = [
         "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
         "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
@@ -103,108 +97,57 @@ def extract_and_build_config(raw_data):
     norm_cfg = cfg.get("normalization", {})
     if hasattr(norm_cfg, '__dict__'):
         norm_cfg = vars(norm_cfg)
-
     obs_scales_raw = norm_cfg.get("obs_scales", {})
     if hasattr(obs_scales_raw, '__dict__'):
         obs_scales_raw = vars(obs_scales_raw)
-
     obs_scales = {
-        "lin_vel": float(obs_scales_raw.get("lin_vel", 2.0)),
-        "ang_vel": float(obs_scales_raw.get("ang_vel", 0.25)),
-        "dof_pos": float(obs_scales_raw.get("dof_pos", 1.0)),
-        "dof_vel": float(obs_scales_raw.get("dof_vel", 0.05)),
-        "body_height": float(obs_scales_raw.get("body_height", 2.0)),
-        "gait_freq": float(obs_scales_raw.get("gait_freq", 1.0)),
-        "gait_phase": float(obs_scales_raw.get("gait_phase", 1.0)),
-        "gait_offset": float(obs_scales_raw.get("gait_offset", 1.0)),
-        "gait_bound": float(obs_scales_raw.get("gait_bound", 1.0)),
-        "gait_duration": float(obs_scales_raw.get("gait_duration", 1.0)),
-        "footswing_height": float(obs_scales_raw.get("footswing_height", 0.15)),
-        "body_pitch": float(obs_scales_raw.get("body_pitch", 0.3)),
-        "body_roll": float(obs_scales_raw.get("body_roll", 0.3)),
-        "stance_width": float(obs_scales_raw.get("stance_width", 1.0)),
-        "stance_length": float(obs_scales_raw.get("stance_length", 1.0)),
-        "aux_reward": float(obs_scales_raw.get("aux_reward", 1.0))
+        "lin_vel": float(obs_scales_raw.get("lin_vel", 2.0)), "ang_vel": float(obs_scales_raw.get("ang_vel", 0.25)),
+        "dof_pos": float(obs_scales_raw.get("dof_pos", 1.0)), "dof_vel": float(obs_scales_raw.get("dof_vel", 0.05)),
+        "body_height": float(obs_scales_raw.get("body_height", 2.0)), "gait_freq": float(obs_scales_raw.get("gait_freq", 1.0)),
+        "gait_phase": float(obs_scales_raw.get("gait_phase", 1.0)), "gait_offset": float(obs_scales_raw.get("gait_offset", 1.0)),
+        "gait_bound": float(obs_scales_raw.get("gait_bound", 1.0)), "gait_duration": float(obs_scales_raw.get("gait_duration", 1.0)),
+        "footswing_height": float(obs_scales_raw.get("footswing_height", 0.15)), "body_pitch": float(obs_scales_raw.get("body_pitch", 0.3)),
+        "body_roll": float(obs_scales_raw.get("body_roll", 0.3)), "stance_width": float(obs_scales_raw.get("stance_width", 1.0)),
+        "stance_length": float(obs_scales_raw.get("stance_length", 1.0)), "aux_reward": float(obs_scales_raw.get("aux_reward", 1.0))
     }
 
-    # 5. 自动推导特征槽位绝对切片表 (Observation Layout)
+    # 5. 自动推导特征槽位绝对切片表 (修正为官方标准 8 段布局)
     obs_layout = []
     current_idx = 0
-
-    # (1) 重力投影
-    obs_layout.append({
-        "name": "projected_gravity",
-        "dim": 3,
-        "slice": [current_idx, current_idx + 3],
-        "description": "机身坐标系重力投影向量 (3维)"
-    })
+    
+    # (1) 机身角速度
+    obs_layout.append({"name": "base_ang_vel", "dim": 3, "slice": [current_idx, current_idx + 3], "description": "机身本体坐标系角速度 (3维, IMU)"})
     current_idx += 3
-
-    # (2) 指令向量
-    obs_layout.append({
-        "name": "commands",
-        "dim": 15,
-        "slice": [current_idx, current_idx + 15],
-        "description": "15 维速度与 MoB 步态调谐指令"
-    })
+    
+    # (2) 重力投影
+    obs_layout.append({"name": "projected_gravity", "dim": 3, "slice": [current_idx, current_idx + 3], "description": "机身坐标系重力投影向量 (3维)"})
+    current_idx += 3
+    
+    # (3) 指令向量 (合并为 15 维整块)
+    obs_layout.append({"name": "commands", "dim": 15, "slice": [current_idx, current_idx + 15], "description": "15 维速度与 MoB 步态调谐指令"})
     current_idx += 15
-
-    # (3) 关节角度误差
-    obs_layout.append({
-        "name": "dof_pos_residual",
-        "dim": 12,
-        "slice": [current_idx, current_idx + 12],
-        "description": "12 关节与默认角度偏差 (q - q_default)"
-    })
+    
+    # (4) 关节角度误差
+    obs_layout.append({"name": "dof_pos_residual", "dim": 12, "slice": [current_idx, current_idx + 12], "description": "12 关节与默认角度偏差 (q - q_default)"})
     current_idx += 12
-
-    # (4) 关节角速度
-    obs_layout.append({
-        "name": "dof_vel",
-        "dim": 12,
-        "slice": [current_idx, current_idx + 12],
-        "description": "12 关节旋转角速度"
-    })
+    
+    # (5) 关节角速度
+    obs_layout.append({"name": "dof_vel", "dim": 12, "slice": [current_idx, current_idx + 12], "description": "12 关节旋转角速度"})
     current_idx += 12
-
-    # (5) 上一步动作
-    obs_layout.append({
-        "name": "actions",
-        "dim": 12,
-        "slice": [current_idx, current_idx + 12],
-        "description": "上一个周期的网络输出动作 (12维)"
-    })
+    
+    # (6) 上一步动作
+    obs_layout.append({"name": "actions", "dim": 12, "slice": [current_idx, current_idx + 12], "description": "上一个周期的网络输出动作 (12维)"})
     current_idx += 12
-
-    # (6) 上上步动作
+    
+    # (7) 上上步动作
     if bool(env_cfg.get("observe_two_prev_actions", True)):
-        obs_layout.append({
-            "name": "last_actions",
-            "dim": 12,
-            "slice": [current_idx, current_idx + 12],
-            "description": "上上周期的历史动作 (12维)"
-        })
+        obs_layout.append({"name": "last_actions", "dim": 12, "slice": [current_idx, current_idx + 12], "description": "上上周期的历史动作 (12维)"})
         current_idx += 12
-
-    # (7) 步态时间步相位
+        
+    # (8) 步态时间步相位
     if bool(env_cfg.get("observe_timing_parameter", True)):
-        obs_layout.append({
-            "name": "gait_indices",
-            "dim": 1,
-            "slice": [current_idx, current_idx + 1],
-            "description": "步态时间步相位积分 (1维)"
-        })
+        obs_layout.append({"name": "gait_indices", "dim": 1, "slice": [current_idx, current_idx + 1], "description": "步态时间步相位积分 (1维)"})
         current_idx += 1
-
-    # (8) 机身角速度 (末尾)
-    if bool(env_cfg.get("observe_vel", True)):
-        obs_layout.append({
-            "name": "base_ang_vel",
-            "dim": 3,
-            "slice": [current_idx, current_idx + 3],
-            "description": "机身本体坐标系角速度 (3维, IMU)"
-        })
-        current_idx += 3
 
     # 组装最终 JSON 字典
     final_config = {
@@ -216,26 +159,12 @@ def extract_and_build_config(raw_data):
             "total_history_input_dim": num_observations * num_obs_history,
             "action_dim": num_actions
         },
-        "control": {
-            "kp": kp_val,
-            "kd": kd_val,
-            "action_scale": action_scale,
-            "policy_dt": 0.02,
-            "policy_freq": 50.0
-        },
-        "joints": {
-            "order": joint_names_order,
-            "default_angles_dict": default_angles_dict,
-            "default_angles_list": default_joint_angles_list
-        },
-        "normalization": {
-            "obs_scales": obs_scales
-        },
+        "control": {"kp": kp_val, "kd": kd_val, "action_scale": action_scale, "policy_dt": 0.02, "policy_freq": 50.0},
+        "joints": {"order": joint_names_order, "default_angles_dict": default_angles_dict, "default_angles_list": default_joint_angles_list},
+        "normalization": {"obs_scales": obs_scales},
         "observation_layout": obs_layout
     }
-
     return final_config
-
 
 def main():
     current_dir = os.path.dirname(os.path.abspath(__file__))
