@@ -1,35 +1,78 @@
+import os
+import io
+import pickle
 import mujoco
 import numpy as np
+import torch
+from action_config import (
+    BODY_MODEL_PATH,
+    ADAPTATION_MODEL_PATH,
+    PARAMS_PATH,
+    POLICY_DT,
+    MAX_VX,
+    MIN_VX,
+    MAX_VY,
+    MAX_WZ,
+    DEFAULT_BODY_HEIGHT,
+    DEFAULT_GAIT_FREQ,
+    DEFAULT_GAIT_PHASE,
+    DEFAULT_GAIT_OFFSET,
+    DEFAULT_GAIT_BOUND,
+    DEFAULT_GAIT_DURATION,
+    DEFAULT_FOOTSWING_HEIGHT,
+    DEFAULT_BODY_PITCH,
+    DEFAULT_BODY_ROLL,
+    DEFAULT_STANCE_WIDTH,
+    DEFAULT_STANCE_LENGTH,
+    DEFAULT_AUX_REWARD,
+    DEFAULT_KP,
+    DEFAULT_KD,
+    ACTION_SCALE,
+    MAX_TORQUE
+)
+
+
+class CPU_Unpickler(pickle.Unpickler):
+    """自定义反序列化器：将 pickle 中保存的 CUDA 存储对象安全重定向到 CPU 内存"""
+    def find_class(self, module, name):
+        if module == 'torch.storage' and name == '_load_from_bytes':
+            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+        return super().find_class(module, name)
+
 
 class Go1MotionController:
     """
-    Go1 运动控制器
-    支持：动态 ID 寻址、解析逆运动学 (IK)、对角小跑步态 (Trot)、跳跃动力学状态机
+    基于 MIT Walk-These-Ways 预训练大脑 (TorchScript) 的 Go1 运动控制器。
+    解决 CPU 跨设备反序列化问题，严格对齐 70 维单步观测与 2100 维时序历史输入，
+    实现原地不动如山的自平衡站立与全向连续高动态运控。
     """
     def __init__(self, model, data):
         self.model = model
         self.data = data
-        self.dt = model.opt.timestep
+        self.sim_dt = model.opt.timestep
 
-        # 1. 动态获取 12 个关节与执行器 ID (彻底消除硬编码索引)
-        self.joint_names = [
-            "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+        # 1. 策略标准的 12 关节命名与顺序 (FL, FR, RL, RR)
+        self.policy_joint_names = [
             "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
-            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
-            "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint"
-        ]
-        self.actuator_names = [
-            "FR_hip", "FR_thigh", "FR_calf",
-            "FL_hip", "FL_thigh", "FL_calf",
-            "RR_hip", "RR_thigh", "RR_calf",
-            "RL_hip", "RL_thigh", "RL_calf"
+            "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+            "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint"
         ]
 
+        # 策略对应的执行器名称
+        self.policy_actuator_names = [
+            "FL_hip", "FL_thigh", "FL_calf",
+            "FR_hip", "FR_thigh", "FR_calf",
+            "RL_hip", "RL_thigh", "RL_calf",
+            "RR_hip", "RR_thigh", "RR_calf"
+        ]
+
+        # 建立 MuJoCo 索引映射
         self.qpos_indices = []
         self.qvel_indices = []
         self.ctrl_indices = []
 
-        for jname in self.joint_names:
+        for jname in self.policy_joint_names:
             jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
             if jid != -1:
                 self.qpos_indices.append(model.jnt_qposadr[jid])
@@ -37,7 +80,7 @@ class Go1MotionController:
             else:
                 raise ValueError(f"无法在模型中找到关节: {jname}")
 
-        for aname in self.actuator_names:
+        for aname in self.policy_actuator_names:
             aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, aname)
             if aid != -1:
                 self.ctrl_indices.append(aid)
@@ -45,208 +88,283 @@ class Go1MotionController:
                 self.ctrl_indices = list(range(12))
                 break
 
-        # 2. Go1 连杆几何参数 (米)
-        self.l_hip = 0.08      # 侧向髋关节偏移
-        self.l_thigh = 0.213   # 大腿长度
-        self.l_calf = 0.213    # 小腿长度
+        self.trunk_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "trunk")
 
-        # 4条腿髋关节根部在机身局部坐标系下的位置 [x, y]
-        # 顺序: 0:FR, 1:FL, 2:RR, 3:RL
-        self.leg_mount_x = [0.1881, 0.1881, -0.1881, -0.1881]
-        self.leg_mount_y = [-0.04675, 0.04675, -0.04675, 0.04675]
-        self.leg_side_sign = [-1.0, 1.0, -1.0, 1.0]
+        # 2. 加载模型参数与 TorchScript 神经网络
+        self._load_policy_and_parameters()
 
-        # 默认静态站立足端坐标 (相对于各腿髋关节根部)
-        self.nominal_foot_z = -0.30
-        self.nominal_foot_y = [-0.08, 0.08, -0.08, 0.08]
+        # 3. 控制分频与时钟管理
+        self.control_dt = POLICY_DT
+        self.decimation = max(1, int(round(self.control_dt / self.sim_dt)))
+        self.step_counter = 0
 
-        # 标准站立关节角
-        self.stand_q = np.array([
-            -0.05, 0.75, -1.45,  # FR
-             0.05, 0.75, -1.45,  # FL
-            -0.05, 0.80, -1.45,  # RR
-             0.05, 0.80, -1.45   # RL
-        ])
-
-        # PD 控制器参数
-        self.kp = 55.0
-        self.kd = 2.8
-        self.max_torque = 23.7  # 最大额定扭矩 (Nm)
-
-        # 速度指令
+        # 4. 指令与步态时钟状态
         self.cmd_vx = 0.0
         self.cmd_vy = 0.0
         self.cmd_wz = 0.0
+        self.gait_indices = torch.zeros(1, dtype=torch.float32)
 
-        self.target_vx = 0.0
-        self.target_vy = 0.0
-        self.target_wz = 0.0
+        self.last_action = torch.zeros((1, 12), dtype=torch.float32)
+        self.last_last_action = torch.zeros((1, 12), dtype=torch.float32)
+        self.current_target_dof_pos = self.default_dof_pos.numpy().copy()
 
-        # Trot 步态参数
-        self.gait_phase = 0.0
-        self.gait_period = 0.42      # 步态周期 (s)
-        self.step_height = 0.065     # 抬腿高度 (m)
+        # 5. 初始化 70 维特征与 30 步历史队列 (总长度 2100 维)
+        self.history_len = getattr(self, "num_obs_history", 30)
+        self.num_obs = getattr(self, "num_observations", 70)
+        self.obs_history_list = []
+        self.reset_state()
 
-        # 跳跃状态机
-        self.jump_state = "IDLE"     # IDLE, CROUCH, THRUST, RETRACT, LAND
-        self.jump_time = 0.0
+    def _load_policy_and_parameters(self):
+        """安全读取 parameters.pkl 并通过 TorchScript 加载策略网络"""
+        if not os.path.exists(BODY_MODEL_PATH) or not os.path.exists(ADAPTATION_MODEL_PATH):
+            raise FileNotFoundError("未在 assets 目录找到 body_latest.jit 或 adaptation_module_latest.jit！")
+
+        print("[策略] 正在加载 TorchScript 模型与参数...")
+        self.body_model = torch.jit.load(BODY_MODEL_PATH, map_location="cpu")
+        self.adaptation_module = torch.jit.load(ADAPTATION_MODEL_PATH, map_location="cpu")
+        self.body_model.eval()
+        self.adaptation_module.eval()
+
+        # 默认出厂参数
+        default_angles_dict = {
+            "FL_hip_joint": 0.1, "FL_thigh_joint": 0.8, "FL_calf_joint": -1.5,
+            "FR_hip_joint": -0.1, "FR_thigh_joint": 0.8, "FR_calf_joint": -1.5,
+            "RL_hip_joint": 0.1, "RL_thigh_joint": 1.0, "RL_calf_joint": -1.5,
+            "RR_hip_joint": -0.1, "RR_thigh_joint": 1.0, "RR_calf_joint": -1.5,
+        }
+        self.kp = DEFAULT_KP
+        self.kd = DEFAULT_KD
+        self.action_scale = ACTION_SCALE
+        self.num_obs_history = 30
+        self.num_observations = 70
+
+        # 观测与指令缩放系数完整默认声明 (补齐 gait_offset / gait_bound / gait_duration)
+        self.scale_lin_vel = 2.0
+        self.scale_ang_vel = 0.25
+        self.scale_dof_pos = 1.0
+        self.scale_dof_vel = 0.05
+        self.scale_body_height = 2.0
+        self.scale_gait_freq = 1.0
+        self.scale_gait_phase = 1.0
+        self.scale_gait_offset = 1.0
+        self.scale_gait_bound = 1.0
+        self.scale_gait_duration = 1.0
+        self.scale_footswing_height = 0.15
+        self.scale_body_pitch = 0.3
+        self.scale_body_roll = 0.3
+        self.scale_stance_width = 1.0
+        self.scale_stance_length = 1.0
+        self.scale_aux_reward = 1.0
+
+        # 使用 CPU_Unpickler 安全读取 parameters.pkl
+        if os.path.exists(PARAMS_PATH):
+            try:
+                try:
+                    params = torch.load(PARAMS_PATH, map_location="cpu")
+                except Exception:
+                    with open(PARAMS_PATH, "rb") as f:
+                        params = CPU_Unpickler(f).load()
+
+                cfg = params.get("Cfg", {})
+                if isinstance(cfg, dict):
+                    # 提取关节默认角
+                    init_state = cfg.get("init_state", {})
+                    if "default_joint_angles" in init_state:
+                        default_angles_dict = init_state["default_joint_angles"]
+
+                    # 提取 PD 增益与动作尺度
+                    control = cfg.get("control", {})
+                    stiffness = control.get("stiffness", {})
+                    damping = control.get("damping", {})
+                    if stiffness:
+                        self.kp = float(list(stiffness.values())[0])
+                    if damping:
+                        self.kd = float(list(damping.values())[0])
+                    self.action_scale = float(control.get("action_scale", ACTION_SCALE))
+
+                    # 提取历史窗口与观测维度
+                    env_cfg = cfg.get("env", {})
+                    self.num_obs_history = int(env_cfg.get("num_observation_history", 30))
+                    self.num_observations = int(env_cfg.get("num_observations", 70))
+
+                    obs_scales = cfg.get("normalization", {}).get("obs_scales", {})
+                    if obs_scales:
+                        self.scale_lin_vel = float(obs_scales.get("lin_vel", self.scale_lin_vel))
+                        self.scale_ang_vel = float(obs_scales.get("ang_vel", self.scale_ang_vel))
+                        self.scale_dof_pos = float(obs_scales.get("dof_pos", self.scale_dof_pos))
+                        self.scale_dof_vel = float(obs_scales.get("dof_vel", self.scale_dof_vel))
+                        self.scale_body_height = float(obs_scales.get("body_height", self.scale_body_height))
+                        self.scale_gait_freq = float(obs_scales.get("gait_freq", self.scale_gait_freq))
+                        self.scale_gait_phase = float(obs_scales.get("gait_phase", self.scale_gait_phase))
+                        self.scale_gait_offset = float(obs_scales.get("gait_offset", self.scale_gait_offset))
+                        self.scale_gait_bound = float(obs_scales.get("gait_bound", self.scale_gait_bound))
+                        self.scale_gait_duration = float(obs_scales.get("gait_duration", self.scale_gait_duration))
+                        self.scale_footswing_height = float(obs_scales.get("footswing_height", self.scale_footswing_height))
+                        self.scale_body_pitch = float(obs_scales.get("body_pitch", self.scale_body_pitch))
+                        self.scale_body_roll = float(obs_scales.get("body_roll", self.scale_body_roll))
+                        self.scale_stance_width = float(obs_scales.get("stance_width", self.scale_stance_width))
+                        self.scale_stance_length = float(obs_scales.get("stance_length", self.scale_stance_length))
+                        self.scale_aux_reward = float(obs_scales.get("aux_reward", self.scale_aux_reward))
+                print("[策略] 成功从 parameters.pkl 读取真实训练配置！")
+            except Exception as e:
+                print(f"[警告] 读取 parameters.pkl 发生异常，使用标准默认配置: {e}")
+
+        # 整理默认关节角度张量
+        default_pos_list = [default_angles_dict.get(name, 0.0) for name in self.policy_joint_names]
+        self.default_dof_pos = torch.tensor(default_pos_list, dtype=torch.float32)
+
+        # 构造 15 维指令尺度向量
+        self.commands_scale = torch.tensor([
+            self.scale_lin_vel, self.scale_lin_vel, self.scale_ang_vel,
+            self.scale_body_height, self.scale_gait_freq,
+            self.scale_gait_phase, self.scale_gait_offset, self.scale_gait_bound, self.scale_gait_duration,
+            self.scale_footswing_height, self.scale_body_pitch, self.scale_body_roll,
+            self.scale_stance_width, self.scale_stance_length, self.scale_aux_reward
+        ], dtype=torch.float32)
+
+        print(f"[策略] 初始化就绪: Kp={self.kp}, Kd={self.kd}, 单帧维度={self.num_observations}, 历史窗口={self.num_obs_history} (总特征={self.num_obs_history*self.num_observations})")
 
     def set_velocity_command(self, vx, vy, wz):
-        """设定目标速度指令"""
-        self.target_vx = np.clip(vx, -0.8, 1.2)
-        self.target_vy = np.clip(vy, -0.5, 0.5)
-        self.target_wz = np.clip(wz, -1.5, 1.5)
+        """设定目标速度向量 (vx, vy, wz)"""
+        self.cmd_vx = np.clip(vx, MIN_VX, MAX_VX)
+        self.cmd_vy = np.clip(vy, -MAX_VY, MAX_VY)
+        self.cmd_wz = np.clip(wz, -MAX_WZ, MAX_WZ)
 
-    def trigger_jump(self):
-        """触发跳跃动作"""
-        if self.jump_state == "IDLE":
-            self.jump_state = "CROUCH"
-            self.jump_time = 0.0
-            print("[动作] >>> 触发跳跃爆发！")
+    def _get_projected_gravity(self):
+        """计算机身坐标系下的重力投影向量 (3维)"""
+        w, x, y, z = self.data.xquat[self.trunk_body_id]
+        gx = 2.0 * (x * z - w * y)
+        gy = 2.0 * (y * z + w * x)
+        gz = -(1.0 - 2.0 * (x * x + y * y))
+        return torch.tensor([gx, gy, gz], dtype=torch.float32)
 
-    def _inverse_kinematics_leg(self, x, y, z, side_sign):
-        """Go1 单腿解析逆运动学 (IK)"""
-        # 1. 髋侧摆角 (Roll)
-        r_yz_sq = y**2 + z**2
-        l_hip_sq = self.l_hip**2
-        if r_yz_sq < l_hip_sq:
-            r_yz_sq = l_hip_sq + 1e-5
+    def _get_current_single_observation(self):
+        """
+        组装符合 Walk-These-Ways 规范的标准 70 维单步观测特征：
+        - 机身角速度 (3维)
+        - 重力投影向量 (3维)
+        - 高层运动指令向量 (15维)
+        - 关节位置偏差 (12维)
+        - 关节角速度 (12维)
+        - 当前动作 (12维)
+        - 上上步历史动作 (12维)
+        - 步态时钟信号 (1维)
+        """
+        # 1. 重力投影 (3维) 与 机身角速度 (3维)
+        projected_gravity = self._get_projected_gravity().unsqueeze(0)
+        cvel = self.data.cvel[self.trunk_body_id]
+        base_ang_vel = torch.tensor(cvel[0:3], dtype=torch.float32).unsqueeze(0) * self.scale_ang_vel
 
-        l_yz = np.sqrt(r_yz_sq - l_hip_sq)
-        theta_base = np.arctan2(y, -z)
-        theta_offset = np.arctan2(side_sign * self.l_hip, l_yz)
-        q_hip = theta_base - theta_offset
+        # 2. 指令向量 (15维)
+        commands = torch.tensor([
+            self.cmd_vx, self.cmd_vy, self.cmd_wz,
+            DEFAULT_BODY_HEIGHT, DEFAULT_GAIT_FREQ,
+            DEFAULT_GAIT_PHASE, DEFAULT_GAIT_OFFSET, DEFAULT_GAIT_BOUND, DEFAULT_GAIT_DURATION,
+            DEFAULT_FOOTSWING_HEIGHT, DEFAULT_BODY_PITCH, DEFAULT_BODY_ROLL,
+            DEFAULT_STANCE_WIDTH, DEFAULT_STANCE_LENGTH, DEFAULT_AUX_REWARD
+        ], dtype=torch.float32)
+        scaled_commands = (commands * self.commands_scale).unsqueeze(0)
 
-        # 2. 矢状面投影长度与膝关节角 (Pitch)
-        d_sq = x**2 + l_yz**2
-        d = np.sqrt(d_sq)
-        d = np.clip(d, 0.05, self.l_thigh + self.l_calf - 1e-4)
-
-        cos_knee = (self.l_thigh**2 + self.l_calf**2 - d**2) / (2.0 * self.l_thigh * self.l_calf)
-        cos_knee = np.clip(cos_knee, -1.0, 1.0)
-        q_calf = -(np.pi - np.arccos(cos_knee))
-
-        # 3. 大腿俯仰角 (Pitch)
-        beta_0 = np.arctan2(x, l_yz)
-        cos_thigh = (self.l_thigh**2 + d**2 - self.l_calf**2) / (2.0 * self.l_thigh * d)
-        cos_thigh = np.clip(cos_thigh, -1.0, 1.0)
-        q_thigh = beta_0 + np.arccos(cos_thigh)
-
-        return q_hip, q_thigh, q_calf
-
-    def _update_jump_state_machine(self):
-        """跳跃四阶段动力学状态机"""
-        self.jump_time += self.dt
-        target_q = self.stand_q.copy()
-        current_kp = self.kp
-        current_kd = self.kd
-
-        if self.jump_state == "CROUCH":
-            # 阶段 1: 下蹲蓄力
-            crouch_z = -0.18
-            for i in range(4):
-                q_h, q_t, q_c = self._inverse_kinematics_leg(0.0, self.nominal_foot_y[i], crouch_z, self.leg_side_sign[i])
-                target_q[i*3 : i*3+3] = [q_h, q_t, q_c]
-            current_kp = 70.0
-            if self.jump_time > 0.15:
-                self.jump_state = "THRUST"
-
-        elif self.jump_state == "THRUST":
-            # 阶段 2: 爆发蹬地
-            thrust_z = -0.38
-            for i in range(4):
-                q_h, q_t, q_c = self._inverse_kinematics_leg(0.0, self.nominal_foot_y[i], thrust_z, self.leg_side_sign[i])
-                target_q[i*3 : i*3+3] = [q_h, q_t, q_c]
-            current_kp = 95.0
-            if self.jump_time > 0.27:
-                self.jump_state = "RETRACT"
-
-        elif self.jump_state == "RETRACT":
-            # 阶段 3: 腾空缩腿
-            retract_z = -0.22
-            for i in range(4):
-                q_h, q_t, q_c = self._inverse_kinematics_leg(0.0, self.nominal_foot_y[i], retract_z, self.leg_side_sign[i])
-                target_q[i*3 : i*3+3] = [q_h, q_t, q_c]
-            current_kp = 40.0
-            if self.jump_time > 0.55:
-                self.jump_state = "LAND"
-
-        elif self.jump_state == "LAND":
-            # 阶段 4: 触地缓冲阻尼
-            land_z = -0.30
-            for i in range(4):
-                q_h, q_t, q_c = self._inverse_kinematics_leg(0.0, self.nominal_foot_y[i], land_z, self.leg_side_sign[i])
-                target_q[i*3 : i*3+3] = [q_h, q_t, q_c]
-            current_kp = 50.0
-            current_kd = 6.5
-            if self.jump_time > 0.85:
-                self.jump_state = "IDLE"
-                self.jump_time = 0.0
-
-        return target_q, current_kp, current_kd
-
-    def _generate_trot_targets(self):
-        """对角小跑步态足端轨迹解算"""
-        alpha = 0.08
-        self.cmd_vx += alpha * (self.target_vx - self.cmd_vx)
-        self.cmd_vy += alpha * (self.target_vy - self.cmd_vy)
-        self.cmd_wz += alpha * (self.target_wz - self.cmd_wz)
-
-        is_moving = (abs(self.cmd_vx) > 0.02 or abs(self.cmd_vy) > 0.02 or abs(self.cmd_wz) > 0.05)
-        if is_moving:
-            self.gait_phase = (self.gait_phase + self.dt / self.gait_period) % 1.0
-        else:
-            self.gait_phase = 0.0
-
-        target_q = np.zeros(12)
-        leg_phase_offsets = [0.0, 0.5, 0.5, 0.0]
-
-        for i in range(4):
-            phi = (self.gait_phase + leg_phase_offsets[i]) % 1.0
-
-            vx_leg = self.cmd_vx - self.cmd_wz * self.leg_mount_y[i]
-            vy_leg = self.cmd_vy + self.cmd_wz * self.leg_mount_x[i]
-
-            step_len_x = vx_leg * (self.gait_period * 0.5)
-            step_len_y = vy_leg * (self.gait_period * 0.5)
-
-            if not is_moving:
-                foot_x = 0.0
-                foot_y = self.nominal_foot_y[i]
-                foot_z = self.nominal_foot_z
-            elif phi < 0.5:
-                # 摆动相
-                tau = phi / 0.5
-                foot_x = -step_len_x * np.cos(np.pi * tau)
-                foot_y = self.nominal_foot_y[i] - step_len_y * np.cos(np.pi * tau)
-                foot_z = self.nominal_foot_z + self.step_height * np.sin(np.pi * tau)
-            else:
-                # 支撑相
-                tau = (phi - 0.5) / 0.5
-                foot_x = step_len_x * (1.0 - 2.0 * tau)
-                foot_y = self.nominal_foot_y[i] + step_len_y * (1.0 - 2.0 * tau)
-                foot_z = self.nominal_foot_z
-
-            q_h, q_t, q_c = self._inverse_kinematics_leg(foot_x, foot_y, foot_z, self.leg_side_sign[i])
-            target_q[i*3 : i*3+3] = [q_h, q_t, q_c]
-
-        return target_q, self.kp, self.kd
-
-    def update(self):
-        """控制器主循环：计算并输出 12 个关节电机力矩"""
-        if self.jump_state != "IDLE":
-            target_q, kp, kd = self._update_jump_state_machine()
-        else:
-            target_q, kp, kd = self._generate_trot_targets()
-
-        # 动态读取 12 关节位置与角速度
+        # 3. 关节位置偏差 (12维) 与 速度 (12维)
         current_q = self.data.qpos[self.qpos_indices]
         current_dq = self.data.qvel[self.qvel_indices]
 
-        # 计算 PD 扭矩
-        torques = kp * (target_q - current_q) - kd * current_dq
+        dof_pos_tensor = torch.tensor(current_q, dtype=torch.float32)
+        dof_vel_tensor = torch.tensor(current_dq, dtype=torch.float32)
 
-        # 输出到执行器
-        clipped_torques = np.clip(torques, -self.max_torque, self.max_torque)
+        dof_pos_scaled = ((dof_pos_tensor - self.default_dof_pos) * self.scale_dof_pos).unsqueeze(0)
+        dof_vel_scaled = (dof_vel_tensor * self.scale_dof_vel).unsqueeze(0)
+
+        # 4. 动作历史 (12维 + 12维)
+        actions = self.last_action
+        last_actions = self.last_last_action
+
+        # 5. 步态时钟相位输入 (1维)
+        timing_inputs = self.gait_indices.unsqueeze(0)
+
+        # 6. 拼接构成 70 维特征: 3 + 3 + 15 + 12 + 12 + 12 + 12 + 1 = 70
+        single_obs = torch.cat([
+            projected_gravity,
+            base_ang_vel,
+            scaled_commands,
+            dof_pos_scaled,
+            dof_vel_scaled,
+            actions,
+            last_actions,
+            timing_inputs
+        ], dim=-1)
+
+        # 严格校验维度：若与模型声明维度不一致则进行稳健对齐
+        if single_obs.shape[-1] < self.num_observations:
+            pad = torch.zeros((1, self.num_observations - single_obs.shape[-1]), dtype=torch.float32)
+            single_obs = torch.cat([single_obs, pad], dim=-1)
+        elif single_obs.shape[-1] > self.num_observations:
+            single_obs = single_obs[:, :self.num_observations]
+
+        return single_obs
+
+    def _run_policy_inference(self):
+        """执行策略网络前向推理 (50Hz)"""
+        # 1. 步态时钟相位推进
+        is_moving = (abs(self.cmd_vx) > 0.01 or abs(self.cmd_vy) > 0.01 or abs(self.cmd_wz) > 0.02)
+        if is_moving:
+            self.gait_indices = (self.gait_indices + DEFAULT_GAIT_FREQ * self.control_dt) % 1.0
+        else:
+            self.gait_indices.zero_()
+
+        # 2. 提取 70 维单帧观测并更新历史队列
+        single_obs = self._get_current_single_observation()
+        self.obs_history_list.append(single_obs)
+        if len(self.obs_history_list) > self.history_len:
+            self.obs_history_list.pop(0)
+
+        # 3. 拼接生成严格符合 (1, 2100) 尺寸的时序张量
+        obs_history = torch.cat(self.obs_history_list, dim=-1)
+
+        # 4. 执行双脑协同前向推理
+        with torch.no_grad():
+            latent = self.adaptation_module(obs_history)
+            policy_input = torch.cat([obs_history, latent], dim=-1)
+            actions = self.body_model(policy_input)
+
+        # 5. 更新动作历史与目标关节角度
+        self.last_last_action = self.last_action.clone()
+        self.last_action = actions.clone()
+
+        action_np = actions.squeeze(0).cpu().numpy()
+        self.current_target_dof_pos = self.default_dof_pos.numpy() + self.action_scale * action_np
+
+    def update(self):
+        """控制器主循环：分频调用策略推理，高频下发关节 PD 力矩"""
+        # 1. 达到分频周期时触发 50Hz 策略前向推理
+        if self.step_counter % self.decimation == 0:
+            self._run_policy_inference()
+        self.step_counter += 1
+
+        # 2. 500Hz 高频关节 PD 伺服
+        current_q = self.data.qpos[self.qpos_indices]
+        current_dq = self.data.qvel[self.qvel_indices]
+
+        torques = self.kp * (self.current_target_dof_pos - current_q) - self.kd * current_dq
+        torques = np.clip(torques, -MAX_TORQUE, MAX_TORQUE)
+
+        # 写入 MuJoCo 执行器
         for i, aid in enumerate(self.ctrl_indices):
-            self.data.ctrl[aid] = clipped_torques[i]
+            self.data.ctrl[aid] = torques[i]
+
+    def reset_state(self):
+        """重置控制器的所有内部状态"""
+        self.step_counter = 0
+        self.cmd_vx = 0.0
+        self.cmd_vy = 0.0
+        self.cmd_wz = 0.0
+        self.gait_indices.zero_()
+        self.last_action = torch.zeros((1, 12), dtype=torch.float32)
+        self.last_last_action = torch.zeros((1, 12), dtype=torch.float32)
+        self.current_target_dof_pos = self.default_dof_pos.numpy().copy()
+
+        # 用初始静态观测完整灌满 30 步历史窗口 (生成完整的 2100 维初始数据)
+        self.obs_history_list = []
+        init_single_obs = self._get_current_single_observation()
+        for _ in range(self.history_len):
+            self.obs_history_list.append(init_single_obs.clone())

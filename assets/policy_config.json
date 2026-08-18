@@ -1,0 +1,137 @@
+{
+    "meta": {
+        "robot_name": "Unitree Go1",
+        "framework": "Walk-These-Ways (MIT Improbable AI)",
+        "policy_input_dim": 70,
+        "history_window_len": 30,
+        "total_history_input_dim": 2100,
+        "action_dim": 12
+    },
+    "control": {
+        "kp": 20.0,
+        "kd": 0.5,
+        "action_scale": 0.25,
+        "policy_dt": 0.02,
+        "policy_freq": 50.0
+    },
+    "joints": {
+        "order": [
+            "FL_hip_joint",
+            "FL_thigh_joint",
+            "FL_calf_joint",
+            "FR_hip_joint",
+            "FR_thigh_joint",
+            "FR_calf_joint",
+            "RL_hip_joint",
+            "RL_thigh_joint",
+            "RL_calf_joint",
+            "RR_hip_joint",
+            "RR_thigh_joint",
+            "RR_calf_joint"
+        ],
+        "default_angles_dict": {
+            "FL_hip_joint": 0.1,
+            "RL_hip_joint": 0.1,
+            "FR_hip_joint": -0.1,
+            "RR_hip_joint": -0.1,
+            "FL_thigh_joint": 0.8,
+            "RL_thigh_joint": 1.0,
+            "FR_thigh_joint": 0.8,
+            "RR_thigh_joint": 1.0,
+            "FL_calf_joint": -1.5,
+            "RL_calf_joint": -1.5,
+            "FR_calf_joint": -1.5,
+            "RR_calf_joint": -1.5
+        },
+        "default_angles_list": [
+            0.1,
+            0.8,
+            -1.5,
+            -0.1,
+            0.8,
+            -1.5,
+            0.1,
+            1.0,
+            -1.5,
+            -0.1,
+            1.0,
+            -1.5
+        ]
+    },
+    "normalization": {
+        "obs_scales": {
+            "lin_vel": 2.0,
+            "ang_vel": 0.25,
+            "dof_pos": 1.0,
+            "dof_vel": 0.05,
+            "body_height": 2.0,
+            "gait_freq": 1.0,
+            "gait_phase": 1.0,
+            "gait_offset": 1.0,
+            "gait_bound": 1.0,
+            "gait_duration": 1.0,
+            "footswing_height": 0.15,
+            "body_pitch": 0.3,
+            "body_roll": 0.3,
+            "stance_width": 1.0,
+            "stance_length": 1.0,
+            "aux_reward": 1.0
+        }
+    },
+    "observation_layout": [
+        {
+            "name": "projected_gravity",
+            "dim": 3,
+            "slice": [
+                0,
+                3
+            ],
+            "description": "机身坐标系重力投影向量 (3维)"
+        },
+        {
+            "name": "commands",
+            "dim": 15,
+            "slice": [
+                3,
+                18
+            ],
+            "description": "15 维速度与 MoB 步态调谐指令"
+        },
+        {
+            "name": "dof_pos_residual",
+            "dim": 12,
+            "slice": [
+                18,
+                30
+            ],
+            "description": "12 关节与默认角度偏差 (q - q_default)"
+        },
+        {
+            "name": "dof_vel",
+            "dim": 12,
+            "slice": [
+                30,
+                42
+            ],
+            "description": "12 关节旋转角速度"
+        },
+        {
+            "name": "actions",
+            "dim": 12,
+            "slice": [
+                42,
+                54
+            ],
+            "description": "上一个周期的网络输出动作 (12维)"
+        },
+        {
+            "name": "last_actions",
+            "dim": 12,
+            "slice": [
+                54,
+                66
+            ],
+            "description": "上上周期的历史动作 (12维)"
+        }
+    ]
+}
